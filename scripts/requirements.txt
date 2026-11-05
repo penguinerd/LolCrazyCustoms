@@ -1,0 +1,15 @@
+# Python dependencies for scripts/train_champion_classifier.py — the champion
+# classifier retrain, driven by `npm run refresh-model`.
+#
+# CPU-only (CI runners, no GPU) — install the CPU torch wheel first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r scripts/requirements.txt
+#
+# GPU (local) — a plain install pulls the default torch build for your platform:
+#   pip install -r scripts/requirements.txt
+
+torch
+torchvision
+numpy
+onnx
+pillow

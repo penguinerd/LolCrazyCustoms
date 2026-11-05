@@ -1,0 +1,941 @@
+import { PeerConnection } from './peer-connection';
+import { SignalingService, SignalMessage } from './signaling';
+import { AudioSettings } from '../core/types';
+import { getStoredInputDeviceId, getStoredOutputDeviceId } from './devices';
+import { AppAudioOutput } from './app-audio-output';
+import { getAppAudio, getAppAudioDevice } from './audio-prefs';
+
+function peakRms(buf: Float32Array): number {
+  let sumSq = 0;
+  for (let i = 0; i < buf.length; i++) {
+    sumSq += buf[i] * buf[i];
+  }
+  return Math.sqrt(sumSq / buf.length);
+}
+
+/**
+ * Compute the per-peer audio gain by combining the server-returned proximity
+ * volume with the user's per-player slider preference. Exported so the
+ * slider-fix logic (issue #7) can be unit-tested without spinning up
+ * AudioService + its PeerConnection / WebAudio dependencies.
+ *
+ * Both inputs are clamped to [0, 1] defensively. The output is their product.
+ */
+export function computeFinalPeerVolume(proximityVol: number, sliderVol: number): number {
+  const p = Math.max(0, Math.min(1, proximityVol));
+  const s = Math.max(0, Math.min(1, sliderVol));
+  return p * s;
+}
+
+/**
+ * Resolve a target proximity volume for every peer that needs one: the union
+ * of peers present in the server response and currently-connected peers.
+ *
+ * Connected peers that are ABSENT from the response are silenced (0). The
+ * v0.3 server omits peers it filtered out (cross-team beyond the hearing cap,
+ * or stale position) from the response entirely, so a missing entry means
+ * "not audible" — NOT "leave unchanged". Without this, a peer once heard
+ * within range stays stuck at its last gain forever after moving out of
+ * range (the "enemy hears me no matter where on the map" bug: the server
+ * correctly drops them, the client failed to act on the absence). In v0.2
+ * the server always included far peers at volume 0, so the client never had
+ * to handle absence.
+ *
+ * `grace` (optional) softens that absence: if a peer was in the response very
+ * recently (within `graceMs`), HOLD its last volume instead of dropping to 0.
+ * A single dropped coords packet — common on lossy / DPI-bypass tunnels (#27)
+ * — briefly removes a peer from the response; without the grace that blips the
+ * audio to silence and straight back, which reads as the volume "flapping".
+ * After the window elapses the peer falls to 0 and the caller's EMA fades it.
+ *
+ * Exported for unit testing without AudioService's WebAudio dependencies.
+ */
+export function resolveProximityTargets(
+  responseVolumes: Record<string, number>,
+  connectedPeerNames: Iterable<string>,
+  grace?: {
+    lastVolumes: Map<string, number>;
+    lastSeenMs: Map<string, number>;
+    now: number;
+    graceMs: number;
+  },
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const [name, v] of Object.entries(responseVolumes)) out.set(name, v);
+  for (const name of connectedPeerNames) {
+    if (out.has(name)) continue;
+    if (grace) {
+      const seen = grace.lastSeenMs.get(name);
+      if (seen !== undefined && grace.now - seen <= grace.graceMs) {
+        out.set(name, grace.lastVolumes.get(name) ?? 0);
+        continue;
+      }
+    }
+    out.set(name, 0);
+  }
+  return out;
+}
+
+// How long to keep a peer at its last proximity volume after it drops out of
+// the server response before fading to 0. Covers a dropped coords packet or two
+// on a lossy / DPI-bypass connection so the audio doesn't blip to silence and
+// back (#27).
+//
+// Shortened from 1500ms once "voice on camera" made a peer leaving the response
+// an ordinary, deliberate event rather than a sign of packet loss: panning the
+// camera off someone should stop their voice promptly, and a tester measured a
+// median 4.9s before an enemy fell silent, of which this window was the largest
+// single part. 300ms still absorbs three ticks at the 10 Hz volume cadence, which
+// is the "packet or two" this exists for. It can afford to be this short
+// because the server independently keeps a peer's last position for
+// STALE_POSITION_MS, so a dropped coords message does not remove them from the
+// response in the first place — this window only ever covers a peer genuinely
+// leaving range or the room.
+const PROXIMITY_GRACE_MS = 300;
+
+// Cap on signals buffered for a peer that does not exist yet. A real trickle-ICE
+// burst is well under half of this; the cap only bounds a peer spraying at the
+// server's 100/sec per-connection allowance.
+const MAX_PENDING_SIGNALS = 64;
+
+/**
+ * Thrown when a peer creation is discarded after its ICE fetch resolved because
+ * the peer left or the session ended in the meantime. Distinct from a genuine
+ * creation failure, which callers must keep propagating.
+ */
+class PeerCreationAbandoned extends Error {
+  constructor(remoteName: string) {
+    super('Peer creation abandoned for ' + remoteName);
+    this.name = 'PeerCreationAbandoned';
+  }
+}
+
+export class AudioService {
+  private localStream: MediaStream | null = null;
+  private peers: Map<string, PeerConnection> = new Map();
+  private signaling: SignalingService;
+  private localName: string;
+  private selfMuted = false;
+  private muteAll = false;
+  private mutedPlayers: Set<string> = new Set();
+  // Track last reported volume state per peer so we only log transitions
+  private lastAppliedVolume: Map<string, string> = new Map();
+  // Last proximity volume the server returned for each peer. Used by
+  // setPlayerVolume so the slider applies on top of real distance, not a
+  // hardcoded 1.0. Updated on every applyPeerVolumes tick.
+  private lastProximityVolumes: Map<string, number> = new Map();
+  // performance.now() of the last tick each peer appeared in the server
+  // response — drives the proximity grace window (see PROXIMITY_GRACE_MS, #27).
+  private lastSeenInResponseMs: Map<string, number> = new Map();
+  // Throttling state for the verbose applyPeerVolumes snapshot log
+  private lastVolumeLogLine = '';
+  private lastVolumeLogMs = 0;
+  private settings: AudioSettings = {
+    // Always-open by default. Push-to-talk is unbound by default (#27) and
+    // bound in Settings; the real PTT keybind lives in the overlay (localStorage
+    // `lolproxchat.pttVk`) + the Rust hook, not this (vestigial) field.
+    inputMode: 'always',
+    inputVolume: 1.0,
+    pttKey: '',
+    playerVolumes: {},
+  };
+
+  // Audio processing state
+  private audioContext: AudioContext | null = null;
+  private gainNode: GainNode | null = null;
+  private outputStream: MediaStream | null = null;
+  // Held so we can swap it when the user picks a different input device at
+  // runtime without renegotiating WebRTC (the destination MediaStream that
+  // PeerConnections received stays the same).
+  private micSource: MediaStreamAudioSourceNode | null = null;
+
+  // Creating a peer awaits an ICE-server fetch, so our own connectToPeer and an
+  // incoming offer can both be inside that await for the same name — and both
+  // used to build an RTCPeerConnection, the loser being overwritten in `peers`
+  // without ever being closed. The slot is now claimed synchronously and the
+  // second caller joins the in-flight creation instead.
+  private peerCreations: Map<string, Promise<PeerConnection>> = new Map();
+  // Identity of the claim currently owning each name, so a creation whose claim
+  // was dropped (peer left, session ended) can tell it is no longer wanted.
+  private peerClaimIds: Map<string, number> = new Map();
+  private nextClaimId = 1;
+  private disposed = false;
+  // Buffer signals that arrive before the peer connection is created
+  private pendingSignals: Map<string, SignalMessage[]> = new Map();
+
+  // PTT state
+  private pttHeld = false;
+
+  /**
+   * Drives every peer's volume glide on a LOCAL clock.
+   *
+   * The glide used to advance one step per proximity update, which arrives only
+   * as fast as a round trip to the signaling server allows — so how quickly a
+   * peer faded out depended on the network, and in practice ran at about half
+   * the rate the smoothing was designed for. Stepping here instead makes the
+   * fade a fixed wall-clock duration, and keeps each individual step small
+   * enough to stay click-free.
+   */
+  private volumeGlideId: number | null = null;
+
+  /**
+   * How a peer connection is built. The default is the real one; tests/e2e
+   * substitutes a fake so two orchestrators can complete the real signaling
+   * handshake — through the real server — without WebRTC. Every creation path
+   * funnels through `createPeer`, so this one seam covers both the
+   * connectToPeer and incoming-offer routes.
+   */
+  private peerFactory: (remoteName: string) => Promise<PeerConnection>;
+
+  constructor(
+    signaling: SignalingService,
+    localName: string,
+    peerFactory: (remoteName: string) => Promise<PeerConnection> = PeerConnection.create,
+  ) {
+    this.signaling = signaling;
+    this.localName = localName;
+    this.peerFactory = peerFactory;
+  }
+
+  /**
+   * Build the send/receive graph. A microphone that cannot be opened no longer
+   * aborts the session: the graph is built without it — the outgoing track is
+   * silence — so the player still hears everyone, and `getMicError()` says why
+   * they are not heard. A later input-device change retries the microphone
+   * into the same graph without renegotiating.
+   */
+  async initMicrophone(): Promise<void> {
+    try {
+      this.localStream = await this.acquireMicStream();
+      this.micError = null;
+    } catch (e) {
+      this.localStream = null;
+      this.micError = describeMicError(e);
+      console.error('[Audio] Microphone unavailable — listening only: ' + this.micError);
+    }
+
+    this.audioContext = new AudioContext();
+    if (this.audioContext.state === 'suspended') {
+      await this.audioContext.resume();
+    }
+    // Honor stored output-device pick if AudioContext.setSinkId is available
+    // (Chromium 110+, which WebView2 evergreen ships).
+    await this.applyStoredOutputDevice();
+
+    this.gainNode = this.audioContext.createGain();
+    this.gainNode.gain.value = this.settings.inputVolume;
+    const destination = this.audioContext.createMediaStreamDestination();
+
+    // Simple straight-through chain: mic → gain → destination. Noise
+    // suppression is handled by the browser's native DSP (set via the
+    // getUserMedia constraints above) which runs off the JS main thread.
+    this.micSource = this.localStream
+      ? this.audioContext.createMediaStreamSource(this.localStream)
+      : null;
+    this.micSource?.connect(this.gainNode);
+    this.gainNode.connect(destination);
+    console.log('[Audio] Using native browser noise suppression');
+
+    this.outputStream = destination.stream;
+    // Apply initial transmit state through the normal path so the first
+    // [Audio] Local mic transmit log line is emitted.
+    this.updateLocalTrackState();
+
+    this.startVolumeGlide();
+
+    // Attach analysers to monitor whether the mic is actually producing audio
+    // and whether the WebRTC-output stream contains audio. Reported every 2s.
+    this.startAudioLevelMonitor(destination);
+
+    if (getAppAudio()) await this.setAppAudio(true);
+  }
+
+  private micError: string | null = null;
+
+  /** Why the microphone could not be opened, or null while it works. */
+  getMicError(): string | null {
+    return this.micError;
+  }
+
+  private micLevelAnalyser: AnalyserNode | null = null;
+  private outputLevelAnalyser: AnalyserNode | null = null;
+  private levelMonitorId: number | null = null;
+
+  private startAudioLevelMonitor(outputDest: MediaStreamAudioDestinationNode): void {
+    if (!this.audioContext) return;
+    // Defensive: never stack two monitors on one service instance.
+    if (this.levelMonitorId !== null) {
+      clearInterval(this.levelMonitorId);
+      this.levelMonitorId = null;
+    }
+    this.micLevelAnalyser = this.audioContext.createAnalyser();
+    this.micLevelAnalyser.fftSize = 1024;
+    this.micSource?.connect(this.micLevelAnalyser);
+
+    // The destination node is a sink — to monitor its output we need to
+    // re-source from its stream via a second source node.
+    const outSource = this.audioContext.createMediaStreamSource(outputDest.stream);
+    this.outputLevelAnalyser = this.audioContext.createAnalyser();
+    this.outputLevelAnalyser.fftSize = 1024;
+    outSource.connect(this.outputLevelAnalyser);
+
+    const micBuf = new Float32Array(this.micLevelAnalyser.fftSize);
+    const outBuf = new Float32Array(this.outputLevelAnalyser.fftSize);
+
+    this.levelMonitorId = window.setInterval(() => {
+      if (!this.micLevelAnalyser || !this.outputLevelAnalyser) return;
+      this.micLevelAnalyser.getFloatTimeDomainData(micBuf);
+      this.outputLevelAnalyser.getFloatTimeDomainData(outBuf);
+      const micPeak = peakRms(micBuf);
+      const outPeak = peakRms(outBuf);
+      const transmitting = !this.selfMuted && this.isTransmitting();
+      console.log(
+        '[Audio] mic=' + micPeak.toFixed(3) +
+        ' out=' + outPeak.toFixed(3) +
+        ' transmit=' + transmitting +
+        ' inputMode=' + this.settings.inputMode +
+        ' selfMuted=' + this.selfMuted,
+      );
+    }, 2000) as unknown as number;
+  }
+
+  /** 20 Hz: fast enough that a fade finishes promptly, slow enough to be cheap. */
+  private static readonly VOLUME_GLIDE_MS = 50;
+
+  private startVolumeGlide(): void {
+    if (this.volumeGlideId !== null) return;
+    this.volumeGlideId = window.setInterval(() => {
+      const now = performance.now();
+      for (const peer of this.peers.values()) peer.stepVolume(now);
+    }, AudioService.VOLUME_GLIDE_MS) as unknown as number;
+  }
+
+  private isTransmitting(): boolean {
+    if (this.selfMuted) return false;
+    if (this.settings.inputMode === 'ptt') return this.pttHeld;
+    // 'always' (default) — transmit unless muted
+    return true;
+  }
+
+  setPTTState(held: boolean): void {
+    console.log('[Audio] setPTTState(' + held + '), inputMode=' + this.settings.inputMode);
+    this.pttHeld = held;
+    this.updateLocalTrackState();
+  }
+
+  private lastTrackEnabled: boolean | null = null;
+  private updateLocalTrackState(): void {
+    if (!this.outputStream) return;
+    const enabled = !this.selfMuted && this.isTransmitting();
+    for (const track of this.outputStream.getAudioTracks()) {
+      track.enabled = enabled;
+    }
+    if (enabled !== this.lastTrackEnabled) {
+      this.lastTrackEnabled = enabled;
+      const reason = this.selfMuted
+        ? 'selfMuted'
+        : this.settings.inputMode === 'ptt'
+          ? 'ptt=' + this.pttHeld
+          : 'always-open';
+      console.log('[Audio] Local mic transmit → ' + enabled + ' (' + reason + ')');
+    }
+  }
+
+  /**
+   * Get the connection for `remoteName`, creating it if nobody else already is.
+   * Exactly one RTCPeerConnection per name however many callers race, because
+   * the claim below is taken in the same synchronous run as the lookup.
+   *
+   * `created` is true only for the caller whose claim actually built the
+   * connection; that caller owns negotiation and nobody else may offer.
+   *
+   * `isInitiator` is honoured only by that claiming caller. Both call sites
+   * derive it as `localName < remoteName` (orchestrator.ts uses the identical
+   * comparison), so a value discarded here can never disagree with the one used.
+   */
+  private async ensurePeer(
+    remoteName: string,
+    isInitiator?: boolean,
+  ): Promise<{ peer: PeerConnection; created: boolean }> {
+    const existing = this.peers.get(remoteName);
+    if (existing) return { peer: existing, created: false };
+    const inFlight = this.peerCreations.get(remoteName);
+    if (inFlight) return { peer: await inFlight, created: false };
+
+    const claimId = this.nextClaimId++;
+    this.peerClaimIds.set(remoteName, claimId);
+    const creation = this.createPeer(remoteName, claimId, isInitiator);
+    this.peerCreations.set(remoteName, creation);
+    return { peer: await creation, created: true };
+  }
+
+  private async createPeer(
+    remoteName: string,
+    claimId: number,
+    isInitiator?: boolean,
+  ): Promise<PeerConnection> {
+    console.log('[Audio] Connecting to peer:', remoteName);
+    try {
+      const peer = await this.peerFactory(remoteName);
+      // The connection can have become unwanted while we awaited the ICE fetch
+      // — the peer left, or the session ended. Both drop the claim, and a peer
+      // inserted after that point is one nobody will ever close.
+      if (this.disposed || this.peerClaimIds.get(remoteName) !== claimId) {
+        peer.close();
+        throw new PeerCreationAbandoned(remoteName);
+      }
+      void peer.setOutputDevice(getStoredOutputDeviceId());
+      this.peers.set(remoteName, peer);
+      if (this.appOut) peer.setAppOutput(this.appOut);
+
+      if (this.outputStream) {
+        peer.addLocalStream(this.outputStream);
+      }
+
+      peer.onIceCandidate = (candidate) => {
+        this.signaling.sendSignal({
+          type: 'ice-candidate',
+          from: this.localName,
+          to: remoteName,
+          payload: candidate.toJSON(),
+        });
+      };
+
+      // Auto-recover from ICE failure. Only the original initiator re-issues
+      // the offer (with iceRestart=true) so we don't both restart and race.
+      // The other side just handles the incoming offer via the normal flow.
+      // Wired here rather than in connectToPeer so a peer that arrived via an
+      // incoming offer is covered too.
+      const shouldInitiate = isInitiator ?? (this.localName < remoteName);
+      if (shouldInitiate) {
+        peer.onIceFailed = () => this.sendIceRestartOffer(remoteName, peer);
+      }
+
+      // Drain here, not in connectToPeer: a peer born from an incoming offer
+      // has buffered candidates too, and is the path that never drained them.
+      this.flushPendingSignals(remoteName);
+      return peer;
+    } finally {
+      // Release only our own claim — an abandoned creation must not clobber the
+      // claim of the connection that replaced it.
+      if (this.peerClaimIds.get(remoteName) === claimId) {
+        this.peerCreations.delete(remoteName);
+        this.peerClaimIds.delete(remoteName);
+      }
+    }
+  }
+
+  private sendIceRestartOffer(remoteName: string, peer: PeerConnection): void {
+    // Defensive: a closure left over from a previous connection to the same
+    // name must not renegotiate the one that replaced it.
+    if (this.peers.get(remoteName) !== peer) return;
+    peer.createOffer({ iceRestart: true })
+      .then((offer) => {
+        console.log('[Audio] Sending ICE-restart offer to:', remoteName);
+        this.signaling.sendSignal({
+          type: 'offer',
+          from: this.localName,
+          to: remoteName,
+          payload: offer,
+        });
+      })
+      .catch((e) => console.warn('[Audio] ICE-restart offer failed for', remoteName, e));
+  }
+
+  private bufferSignal(signal: SignalMessage): void {
+    let pending = this.pendingSignals.get(signal.from);
+    if (!pending) {
+      pending = [];
+      this.pendingSignals.set(signal.from, pending);
+    }
+    // Drop the newest rather than shifting the oldest out: host and
+    // server-reflexive candidates arrive first and are the ones that carry a
+    // connection between two players on the same NAT.
+    if (pending.length >= MAX_PENDING_SIGNALS) return;
+    pending.push(signal);
+    if (pending.length === MAX_PENDING_SIGNALS) {
+      console.warn('[Audio] Pending signal buffer full for', signal.from,
+        '— dropping further signals until the peer exists');
+    }
+  }
+
+  private flushPendingSignals(remoteName: string): void {
+    const pending = this.pendingSignals.get(remoteName);
+    if (!pending) return;
+    this.pendingSignals.delete(remoteName);
+    // INVARIANT: replays are dispatched fire-and-forget and createPeer must
+    // never await them. A replay runs through handleSignal, which is what is
+    // waiting on this creation — awaiting it here would wait on ourselves.
+    for (const sig of pending) {
+      this.handleSignal(sig).catch(e =>
+        console.error('[Audio] Failed to replay buffered signal:', sig.type, e));
+    }
+  }
+
+  // Connect to a new peer
+  async connectToPeer(remoteName: string, isInitiator?: boolean): Promise<void> {
+    let peer: PeerConnection;
+    let created: boolean;
+    try {
+      ({ peer, created } = await this.ensurePeer(remoteName, isInitiator));
+    } catch (e) {
+      if (e instanceof PeerCreationAbandoned) {
+        console.log('[Audio] Peer creation abandoned (left or session ended):', remoteName);
+        return;
+      }
+      // A genuine failure must keep propagating: the orchestrator drops its
+      // peerState on a throw and retries on the next position broadcast.
+      throw e;
+    }
+    // Someone else's claim built this connection and owns its negotiation.
+    if (!created) return;
+    // disconnectPeer is synchronous and can have run in the gap since the
+    // creation resolved; offering now would go to a player who has left.
+    if (this.peers.get(remoteName) !== peer) return;
+
+    const shouldInitiate = isInitiator ?? (this.localName < remoteName);
+    if (!shouldInitiate) return;
+
+    console.log('[Audio] Creating offer (initiator) to:', remoteName);
+    try {
+      const offer = await peer.createOffer();
+      this.signaling.sendSignal({
+        type: 'offer',
+        from: this.localName,
+        to: remoteName,
+        payload: offer,
+      });
+    } catch (e) {
+      console.error('[Audio] Failed to create offer for:', remoteName, e);
+      if (this.peers.get(remoteName) === peer) this.dropPeer(remoteName);
+      else peer.close();
+    }
+  }
+
+  // Handle incoming WebRTC signals
+  async handleSignal(signal: SignalMessage): Promise<void> {
+    console.log('[Audio] Received signal:', signal.type, 'from:', signal.from);
+    try {
+      if (signal.type === 'offer') {
+        const { peer, created } = await this.ensurePeer(signal.from);
+        if (created) {
+          // Peer is reaching us first via the signaling channel — orchestrator's
+          // "Peer joined" log only fires once their first position broadcast
+          // arrives, which can be seconds later (or never if they're idle in
+          // base). Log here so the join is always traceable in diagnostics.
+          console.log('[Audio] Peer created via incoming offer: ' + signal.from);
+        }
+        const answer = await peer.handleOffer(signal.payload);
+        this.signaling.sendSignal({
+          type: 'answer',
+          from: this.localName,
+          to: signal.from,
+          payload: answer,
+        });
+        return;
+      }
+
+      const peer = this.peers.get(signal.from);
+      if (!peer) {
+        // Buffer signals that arrive before the peer connection is created;
+        // whichever path creates it replays them.
+        this.bufferSignal(signal);
+        return;
+      }
+      if (signal.type === 'answer') {
+        await peer.handleAnswer(signal.payload);
+      } else if (signal.type === 'ice-candidate') {
+        await peer.addIceCandidate(signal.payload);
+      }
+    } catch (e) {
+      if (e instanceof PeerCreationAbandoned) {
+        console.log('[Audio] Peer creation abandoned (left or session ended):', signal.from);
+        return;
+      }
+      console.error('[Audio] Signal handling failed:', signal.type, 'from:', signal.from, e);
+    }
+  }
+
+  disconnectPeer(remoteName: string): void {
+    this.dropPeer(remoteName);
+  }
+
+  /**
+   * Close the connection for `name` and forget every per-name collection keyed
+   * on it, so nothing (least of all a previous connection's ICE candidates)
+   * outlives it into the next connection to the same player.
+   */
+  private dropPeer(name: string): void {
+    const peer = this.peers.get(name);
+    if (peer) {
+      peer.close();
+      this.peers.delete(name);
+    }
+    // Dropping the claim is what tells a creation still awaiting its ICE fetch
+    // to abandon rather than land in `peers` after we stopped caring.
+    this.peerCreations.delete(name);
+    this.peerClaimIds.delete(name);
+    this.pendingSignals.delete(name);
+  }
+
+  applyPeerVolumes(volumes: Record<string, number>): void {
+    // Verbose snapshot of every server-returned per-peer volume. Lets us
+    // distinguish "server said 0 / we played 0" from "server said 0.8 /
+    // EMA stuck near 1" when debugging volume bugs. Already silent unless
+    // Debug is on (console.log is no-op'd by core/logging.ts). Throttled
+    // to ≥1s OR when the summary string changes, so an active session
+    // doesn't drown the log in ~10 lines/sec of identical snapshots.
+    const entries = Object.entries(volumes);
+    const summary = entries.length
+      ? entries.map(([n, v]) => `${n}=${v.toFixed(2)}`).join(' ')
+      : '(none)';
+    const skipped = entries.filter(([n]) => !this.peers.has(n)).map(([n]) => n);
+    const skippedTag = skipped.length ? `(skipped no-peer: ${skipped.join(',')})` : '';
+    const fullLine = summary + (skippedTag ? ' ' + skippedTag : '');
+    const now = performance.now();
+    if (fullLine !== this.lastVolumeLogLine || now - this.lastVolumeLogMs >= 1000) {
+      console.log('[Audio] applyPeerVolumes:', fullLine);
+      this.lastVolumeLogLine = fullLine;
+      this.lastVolumeLogMs = now;
+    }
+
+    // Mark every peer present in this response as freshly seen, so the grace
+    // window below only holds peers that genuinely just dropped out.
+    for (const name of Object.keys(volumes)) this.lastSeenInResponseMs.set(name, now);
+
+    // Process the union of response peers AND connected peers. Connected peers
+    // absent from `volumes` are silenced (0) — but a peer seen within the last
+    // PROXIMITY_GRACE_MS holds its last volume first, so a single dropped coords
+    // packet on a lossy tunnel doesn't blip the audio to silence and back (#27).
+    const targets = resolveProximityTargets(volumes, this.peers.keys(), {
+      lastVolumes: this.lastProximityVolumes,
+      lastSeenMs: this.lastSeenInResponseMs,
+      now,
+      graceMs: PROXIMITY_GRACE_MS,
+    });
+    for (const [name, volume] of targets) {
+      // Remember the proximity volume per peer so setPlayerVolume (the
+      // per-row slider in the UI) can recompute finalVol correctly without
+      // waiting for the next position tick. Was using a hardcoded 1.0 which
+      // briefly played peers at full volume regardless of real distance —
+      // caused user-reported "moved the slider and started hearing them"
+      // blip on issue #7.
+      this.lastProximityVolumes.set(name, volume);
+
+      const peer = this.peers.get(name);
+      if (!peer) continue;
+      const playerVolume = this.settings.playerVolumes[name] ?? 1.0;
+      const finalVol = computeFinalPeerVolume(volume, playerVolume);
+      const wasState = this.lastAppliedVolume.get(name);
+      // Always update volume so it's correct when unmuted. Don't hard-mute on
+      // finalVol === 0 — the smoothed gain ramp handles it without a click,
+      // and it lets brief proximity zeros (CV tracking glitches) fade gracefully.
+      peer.setVolume(finalVol);
+      const muteNow = this.muteAll || this.mutedPlayers.has(name);
+      if (muteNow) {
+        peer.mute();
+      } else {
+        peer.unmute();
+      }
+      // Log audible/silent transitions (skip steady-state to keep noise down)
+      const stateNow = muteNow ? 'silent' : finalVol.toFixed(2);
+      if (wasState !== stateNow) {
+        console.log('[Audio] peer ' + name + ' → ' + stateNow +
+          (wasState !== undefined ? ' (was ' + wasState + ')' : ''));
+        this.lastAppliedVolume.set(name, stateNow);
+      }
+    }
+  }
+
+  // Mute controls
+  toggleSelfMute(): boolean {
+    this.setSelfMuted(!this.selfMuted);
+    return this.selfMuted;
+  }
+
+  setSelfMuted(value: boolean): void {
+    if (this.selfMuted === value) return;
+    this.selfMuted = value;
+    this.updateLocalTrackState();
+  }
+
+  toggleMuteAll(): boolean {
+    this.setMuteAll(!this.muteAll);
+    return this.muteAll;
+  }
+
+  setMuteAll(value: boolean): void {
+    if (this.muteAll === value) return;
+    this.muteAll = value;
+    for (const [name, peer] of this.peers) {
+      if (this.muteAll || this.mutedPlayers.has(name)) {
+        peer.mute();
+      } else {
+        peer.unmute();
+      }
+    }
+  }
+
+  toggleMutePlayer(name: string): boolean {
+    if (this.mutedPlayers.has(name)) {
+      this.mutedPlayers.delete(name);
+    } else {
+      this.mutedPlayers.add(name);
+    }
+    const peer = this.peers.get(name);
+    if (peer) {
+      if (this.mutedPlayers.has(name)) {
+        peer.mute();
+      } else {
+        peer.unmute();
+      }
+    }
+    return this.mutedPlayers.has(name);
+  }
+
+  setPlayerVolume(name: string, volume: number): void {
+    this.settings.playerVolumes[name] = Math.max(0, Math.min(1, volume));
+    const peer = this.peers.get(name);
+    if (peer) {
+      // Use the last server-returned proximity volume — NOT a hardcoded 1.0.
+      // The old hardcoded path briefly played the peer at slider-value × 1.0
+      // before the next 100 ms position tick zeroed it out (issue #7
+      // "moved the slider and started hearing them" symptom).
+      const proximityVol = this.lastProximityVolumes.get(name) ?? 0;
+      peer.setVolume(computeFinalPeerVolume(proximityVol, this.settings.playerVolumes[name]));
+    }
+  }
+
+  /**
+   * Voice level (0..1) of every connected peer we can actually hear right now:
+   * a volume above 0 and not muted. Peers we cannot hear are left out, so the
+   * speaking overlay only ever shows a voice that is coming out of the speakers.
+   */
+  getHeardVoiceLevels(): Map<string, number> {
+    const out = new Map<string, number>();
+    if (this.muteAll) return out;
+    for (const [name, peer] of this.peers) {
+      if (this.mutedPlayers.has(name)) continue;
+      const vol = computeFinalPeerVolume(this.lastProximityVolumes.get(name) ?? 0, this.settings.playerVolumes[name] ?? 1.0);
+      if (vol <= 0) continue;
+      out.set(name, peer.getAudioLevel?.() ?? 0);
+    }
+    return out;
+  }
+
+  private ownLevelBuf: Float32Array<ArrayBuffer> | null = null;
+
+  /** Our microphone's level (RMS, 0..1) while it is actually being sent, else 0. */
+  getOwnVoiceLevel(): number {
+    if (!this.micLevelAnalyser || !this.isTransmitting()) return 0;
+    if (!this.ownLevelBuf || this.ownLevelBuf.length !== this.micLevelAnalyser.fftSize) {
+      this.ownLevelBuf = new Float32Array(this.micLevelAnalyser.fftSize);
+    }
+    this.micLevelAnalyser.getFloatTimeDomainData(this.ownLevelBuf);
+    return peakRms(this.ownLevelBuf);
+  }
+
+  isSelfMuted(): boolean { return this.selfMuted; }
+  isMuteAll(): boolean { return this.muteAll; }
+  isPlayerMuted(name: string): boolean { return this.mutedPlayers.has(name); }
+
+  getPeer(name: string): PeerConnection | undefined {
+    return this.peers.get(name);
+  }
+
+  hasPeer(name: string): boolean {
+    return this.peers.has(name);
+  }
+
+  updateSettings(settings: Partial<AudioSettings>): void {
+    Object.assign(this.settings, settings);
+    this.applyInputVolume();
+    this.updateLocalTrackState();
+  }
+
+  private applyInputVolume(): void {
+    if (this.gainNode) {
+      this.gainNode.gain.value = this.settings.inputVolume;
+    }
+  }
+
+  private async acquireMicStream(): Promise<MediaStream> {
+    const inputId = getStoredInputDeviceId();
+    const constraints: MediaTrackConstraints = {
+      // Native Chromium DSP runs in the audio thread — can't be starved by
+      // our main-thread CV work the way RNNoise's ScriptProcessorNode was.
+      // Quality is the WebRTC NS3 algorithm Discord used pre-Krisp.
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    if (!inputId) return navigator.mediaDevices.getUserMedia({ audio: constraints });
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: { ...constraints, deviceId: { exact: inputId } },
+      });
+    } catch (e) {
+      // A chosen device that is gone (unplugged headset) would otherwise fail
+      // every retry for good; the Windows default is better than silence.
+      const name = (e as { name?: unknown } | null)?.name;
+      if (name !== 'NotFoundError' && name !== 'OverconstrainedError') throw e;
+      console.warn('[Audio] Chosen input device unavailable (' + name + ') — using the default');
+      return navigator.mediaDevices.getUserMedia({ audio: constraints });
+    }
+  }
+
+  private async applyStoredOutputDevice(): Promise<void> {
+    const outputId = getStoredOutputDeviceId();
+    if (!outputId) return;
+    // Playback is element-only, so the output device is applied per peer via
+    // HTMLMediaElement.setSinkId (more widely supported than AudioContext.setSinkId).
+    for (const peer of this.peers.values()) {
+      await peer.setOutputDevice(outputId);
+    }
+    console.log('[Audio] Output device applied to', this.peers.size, 'peer(s):', outputId);
+  }
+
+  // Re-acquire mic from the new device, swap the source node in place.
+  // outputStream / destination stay the same so peer connections keep
+  // working without renegotiation.
+  async applyInputDevice(_id: string | null): Promise<void> {
+    if (!this.audioContext || !this.gainNode) {
+      console.log('[Audio] applyInputDevice: not initialized yet, will pick up on next session');
+      return;
+    }
+    try {
+      const newStream = await this.acquireMicStream();
+      // The session may have ended while the device was opening; a stream
+      // nobody will stop keeps the microphone captured until the app exits.
+      if (this.disposed || !this.audioContext || !this.gainNode) {
+        newStream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      this.micSource?.disconnect();
+      this.localStream?.getTracks().forEach((t) => t.stop());
+      this.localStream = newStream;
+      this.micSource = this.audioContext.createMediaStreamSource(newStream);
+      this.micSource.connect(this.gainNode);
+      // The level meter follows the live source; before this it kept reading
+      // the first device's node after a switch.
+      if (this.micLevelAnalyser) this.micSource.connect(this.micLevelAnalyser);
+      this.micError = null;
+      this.updateLocalTrackState();
+      console.log('[Audio] Input device switched');
+    } catch (e) {
+      // Only a session that never had a working mic reports this one; a failed
+      // switch away from a working device leaves that device in place.
+      if (!this.localStream) this.micError = describeMicError(e);
+      console.warn('[Audio] applyInputDevice failed:', e);
+    }
+  }
+
+  // ---- App audio: voices played by lolproxchat.exe (app-audio-output.ts) ----
+
+  private appOut: AppAudioOutput | null = null;
+  private appOutStarting: Promise<void> | null = null;
+
+  /**
+   * Turn app audio on or off, live: every peer moves between playing in the
+   * browser and playing through lolproxchat.exe. If app audio cannot start, or fails
+   * later, the voices stay in (or go back to) the browser, so nobody is left
+   * hearing nothing.
+   */
+  async setAppAudio(enabled: boolean): Promise<void> {
+    await this.appOutStarting;
+    if (this.disposed) return;
+    if (enabled && !this.appOut) {
+      this.appOutStarting = (async () => {
+        const out = new AppAudioOutput((reason) => {
+          if (this.appOut !== out) return;
+          console.warn('[Audio] App audio failed (' + reason + ') — voices back in the browser');
+          this.appOut = null;
+          for (const peer of this.peers.values()) peer.setAppOutput(null);
+        });
+        if (!(await out.start(getAppAudioDevice()))) return;
+        if (this.disposed) { await out.stop(); return; }
+        this.appOut = out;
+        for (const peer of this.peers.values()) peer.setAppOutput(out);
+        console.log('[Audio] App audio on for ' + this.peers.size + ' peer(s)');
+      })();
+      await this.appOutStarting;
+      this.appOutStarting = null;
+    } else if (!enabled && this.appOut) {
+      const out = this.appOut;
+      this.appOut = null;
+      for (const peer of this.peers.values()) peer.setAppOutput(null);
+      await out.stop();
+      console.log('[Audio] App audio off — voices back in the browser');
+    }
+  }
+
+  /** The app-audio device changed in Settings (a name from its own list). */
+  async setAppAudioDevice(name: string | null): Promise<void> {
+    await this.appOut?.setDevice(name);
+  }
+
+  async applyOutputDevice(_id: string | null): Promise<void> {
+    if (!this.audioContext) {
+      console.log('[Audio] applyOutputDevice: not initialized yet, will pick up on next session');
+      return;
+    }
+    await this.applyStoredOutputDevice();
+  }
+
+  cleanup(): void {
+    // Set first: a creation still awaiting its ICE fetch checks this and closes
+    // itself instead of inserting into a map nobody will iterate again.
+    this.disposed = true;
+    this.micError = null;
+    this.peerCreations.clear();
+    this.peerClaimIds.clear();
+    this.pendingSignals.clear();
+
+    // The level monitor is a bare setInterval that closes over the analyser
+    // nodes. Before v0.5.8 nothing ever cleared it, so every game left another
+    // 2s logging loop running against a closed AudioContext for the lifetime of
+    // the process — you can count three overlapping meter loops in NotOtakuu's
+    // 2026-09-12 log (interleaved mic=0.031 / mic=0.012 / mic=0.001 lines).
+    if (this.levelMonitorId !== null) {
+      clearInterval(this.levelMonitorId);
+      this.levelMonitorId = null;
+    }
+    if (this.volumeGlideId !== null) {
+      clearInterval(this.volumeGlideId);
+      this.volumeGlideId = null;
+    }
+    this.micLevelAnalyser = null;
+    this.outputLevelAnalyser = null;
+
+    for (const [, peer] of this.peers) {
+      peer.close();
+    }
+    this.peers.clear();
+    const appOut = this.appOut;
+    this.appOut = null;
+    void appOut?.stop();
+    this.outputStream?.getTracks().forEach((t) => t.stop());
+    this.outputStream = null;
+    this.localStream?.getTracks().forEach((t) => t.stop());
+    this.localStream = null;
+    this.audioContext?.close();
+    this.audioContext = null;
+  }
+}
+
+/**
+ * One line for the log. A DOMException's name is what tells the cases apart:
+ * NotAllowedError is a permission (WebView2's own or Windows' privacy switch),
+ * NotFoundError / OverconstrainedError a device that is gone, NotReadableError
+ * a device another program holds exclusively.
+ */
+export function describeMicError(e: unknown): string {
+  if (e && typeof e === 'object') {
+    const name = (e as { name?: unknown }).name;
+    const message = (e as { message?: unknown }).message;
+    if (typeof name === 'string' && name) {
+      return typeof message === 'string' && message ? name + ': ' + message : name;
+    }
+  }
+  return String(e);
+}

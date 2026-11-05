@@ -1,0 +1,162 @@
+name: Build + draft release
+
+# Builds the Windows client and creates a DRAFT GitHub Release with the
+# lolproxchat.exe asset, its SHA-256, and a VirusTotal scan link — the exe is
+# submitted to VT during the build (direct API call, key never touches a
+# third-party action), so the scan is reviewable in the draft before publish.
+# A human reviews and publishes the draft; publishing exposes the build to the
+# in-app updater (it reads releases/latest; drafts are invisible until published,
+# and the asset must be named exactly lolproxchat.exe).
+#
+# Triggers (all GitHub-hosted, no secrets — PROXCHAT_SERVER defaults at build):
+#   - a version bump landing on main: Cargo.toml changes AND its version has no
+#     tag yet. Fires after an auto-retrain PR merges, or a manual bump is pushed.
+#     The gate job creates the tag; no separate `git tag` step needed.
+#   - manual workflow_dispatch (always builds the current Cargo.toml version).
+
+on:
+  push:
+    branches: [main]
+    paths: ['src-tauri/Cargo.toml']
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the release + tag + upload assets
+
+jobs:
+  # Cheap ubuntu gate: decide the tag and whether a build is warranted, so the
+  # windows build only spins up for a genuinely new version.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: decide
+        run: |
+          event="${{ github.event_name }}"
+          tag="v$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/.*"(.+)".*/\1/')"
+          # Build a NEW version only: skip if the tag already exists (e.g. a
+          # Cargo.toml edit that didn't bump the version). Dispatch always builds.
+          if [ "$event" = "workflow_dispatch" ]; then
+            proceed=true
+          elif git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            proceed=false
+          else
+            proceed=true
+          fi
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+          echo "event=$event -> tag=$tag proceed=$proceed"
+
+  build:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: windows-latest
+    env:
+      TAG: ${{ needs.gate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install npm deps
+        run: npm ci
+
+      # Runs `npm run build:prod` (webpack) via beforeBuildCommand, then compiles
+      # the binary. --no-bundle skips the MSI/NSIS installers; we ship the raw exe.
+      - name: Build (tauri)
+        run: npx tauri build --no-bundle
+
+      - name: Locate exe + compute SHA-256
+        id: artifact
+        shell: pwsh
+        run: |
+          $exe = "src-tauri/target/release/lolproxchat.exe"
+          if (-not (Test-Path $exe)) { Write-Error "exe not found at $exe"; exit 1 }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "sha256=$hash"   >> $env:GITHUB_OUTPUT
+          "exe_path=$exe"  >> $env:GITHUB_OUTPUT
+          Write-Host "SHA-256: $hash"
+
+      - name: Submit to VirusTotal
+        id: vt
+        shell: pwsh
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+          EXE: ${{ steps.artifact.outputs.exe_path }}
+          SHA256: ${{ steps.artifact.outputs.sha256 }}
+        run: |
+          # Direct VT API call so the key never passes through a third-party action.
+          # Non-fatal: a VT hiccup must never block the release. The report lives at
+          # gui/file/<sha256> once VT has the upload (exe ~27MB, under VT's 32MB limit).
+          if (-not $env:VT_API_KEY) {
+            Write-Host "::warning::VT_API_KEY not set — skipping VirusTotal submission."
+            "url=" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          try {
+            $headers = @{ 'x-apikey' = $env:VT_API_KEY }
+            $form = @{ file = Get-Item $env:EXE }
+            $resp = Invoke-RestMethod -Uri 'https://www.virustotal.com/api/v3/files' -Method Post -Headers $headers -Form $form -TimeoutSec 180
+            Write-Host "Submitted to VirusTotal (analysis id: $($resp.data.id))"
+            "url=https://www.virustotal.com/gui/file/$($env:SHA256)" >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Host "::warning::VirusTotal submission failed: $($_.Exception.Message)"
+            "url=" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Compose release notes
+        shell: pwsh
+        env:
+          SHA256: ${{ steps.artifact.outputs.sha256 }}
+          VT_URL: ${{ steps.vt.outputs.url }}
+        run: |
+          $body = ''
+          if (Test-Path CHANGELOG.md) {
+            $lines = Get-Content CHANGELOG.md
+            $start = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match ('^##\s*\[' + [regex]::Escape($env:TAG) + '\]')) { $start = $i; break }
+            }
+            if ($start -ge 0) {
+              $collected = @()
+              for ($j = $start + 1; $j -lt $lines.Count; $j++) {
+                if ($lines[$j] -match '^##\s*\[') { break }
+                $collected += $lines[$j]
+              }
+              $body = ($collected -join "`n").Trim()
+            }
+          }
+          if (-not $body) { $body = "Automated build for $($env:TAG)." }
+          $fence = '```'
+          $notes  = $body
+          $notes += "`n`n---`n`n**SHA-256** (verify before running):`n`n"
+          $notes += $fence + "`n" + $env:SHA256 + "`n" + $fence
+          $notes += "`n`nPowerShell:  Get-FileHash .\lolproxchat.exe -Algorithm SHA256`n"
+          if ($env:VT_URL) { $notes += "`n**VirusTotal scan:** $($env:VT_URL)`n" }
+          Set-Content -Path RELEASE_NOTES.md -Value $notes -Encoding utf8
+          Write-Host "---- release notes ----"
+          Get-Content RELEASE_NOTES.md
+
+      - name: Create or update draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXE: ${{ steps.artifact.outputs.exe_path }}
+        run: |
+          $asset = "$($env:EXE)#lolproxchat.exe"
+          gh release view $env:TAG 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $asset --clobber
+            gh release edit   $env:TAG --notes-file RELEASE_NOTES.md
+          } else {
+            gh release create $env:TAG $asset --draft --title $env:TAG --notes-file RELEASE_NOTES.md --target $env:GITHUB_SHA
+          }
+          Write-Host "Draft release ready for $($env:TAG) — review and publish it in the Releases tab."
