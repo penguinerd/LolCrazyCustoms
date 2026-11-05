@@ -1,0 +1,37 @@
+node_modules/
+dist/
+.env
+
+# Build artifacts
+*.opk
+
+# Large generated assets (not needed for build)
+assets/champion-circles/
+scripts/synthetic-data/
+src/data/champion-fingerprints.json
+
+# Python
+scripts/__pycache__/
+*.pyc
+
+# PyTorch checkpoint (large, ONNX model is the shipped artifact)
+models/*.pt
+
+# Rust/Tauri build artifacts
+src-tauri/target/
+
+# Temp/logs
+logs.txt
+
+# Claude Code session-local settings
+.claude/
+
+# Git worktrees (per-feature isolated checkouts)
+.worktrees/
+.playwright-mcp/
+
+# scratch analysis / contact-sheet images from CV debugging
+/_*.png
+tests/cv/fixtures-real/
+tests/cv/fixtures-icons/
+tests/cv/fixtures-games/

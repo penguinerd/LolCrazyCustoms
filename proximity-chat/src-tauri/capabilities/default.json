@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions required by the panel, scanner and speakers windows. Without an explicit capability, Tauri denies all built-in plugin IPC (start_dragging, set_ignore_cursor_events, event emit/listen) even though custom invoke handlers still work.",
+  "windows": ["overlay", "scanner", "speakers"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

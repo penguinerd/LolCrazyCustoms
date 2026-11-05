@@ -1,0 +1,81 @@
+name: proxchat
+
+# ============================================================================
+# TURN backend selection
+# ----------------------------------------------------------------------------
+# By default this compose uses Cloudflare Realtime TURN — set TURN_KEY_ID and
+# TURN_KEY_API_TOKEN in your .env file (next to this compose). Get them from
+# the Cloudflare Dashboard → Realtime → TURN → Create TURN Key.
+#
+# If you'd rather self-host coturn instead:
+#   1. Leave TURN_KEY_ID / TURN_KEY_API_TOKEN unset in .env
+#   2. Set TURN_SERVER and TURN_SECRET in .env (server falls back to coturn-
+#      HMAC credentials when the Cloudflare vars are absent)
+#   3. Uncomment the `coturn` service block at the bottom of this file
+#   4. Configure coturn/turnserver.conf and (optionally) TLS_CERT_DIR — see
+#      docs/self-hosting.md § "Optional: self-host coturn"
+# ============================================================================
+
+services:
+  server:
+    container_name: proxchat-server
+    build: ./server
+    # Published on all interfaces so a reverse proxy running in its own
+    # container can reach it. If your proxy runs on the host instead, prefer
+    # "127.0.0.1:3100:3100" — nothing outside then reaches the server except
+    # through TLS. See docs/self-hosting.md § "Client IP and rate limits".
+    ports:
+      - "3100:3100"
+    environment:
+      - PORT=3100
+      # Which addresses your own reverse proxies connect from. "private" for
+      # the Caddy / nginx setup in the docs (a proxy on this host or Docker
+      # network); add your CDN's published ranges if one sits in front of that
+      # proxy ("private,<ranges>"); "off" to ignore forwarding headers entirely
+      # (no proxy, or a rootless container runtime that rewrites source
+      # addresses). docs/self-hosting.md § "Client IP and rate limits" has the
+      # details — a wrong value rate-limits every user as if they were one client.
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      # Deprecated hop count, used only while TRUSTED_PROXIES is unset — kept
+      # so a deployment that set it keeps working until it switches over.
+      - TRUST_PROXY=${TRUST_PROXY:-}
+      # Cloudflare Realtime TURN (preferred)
+      - TURN_KEY_ID=${TURN_KEY_ID:-}
+      - TURN_KEY_API_TOKEN=${TURN_KEY_API_TOKEN:-}
+      # Self-hosted coturn fallback (only used when the Cloudflare vars above
+      # are unset). Safe to leave blank if you're on Cloudflare TURN.
+      - TURN_SERVER=${TURN_SERVER:-}
+      - TURN_SECRET=${TURN_SECRET:-}
+      # Legacy: only the old pre-v0.3 encrypted-position path used this; the
+      # current tiered path ignores it. Leave it unset — the :- keeps compose quiet.
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3100/health').then(r=>{if(!r.ok)throw 1})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ----------------------------------------------------------------------------
+  # Optional: self-hosted coturn. Uncomment this block if you set TURN_SERVER
+  # and TURN_SECRET above and want to run your own TURN relay instead of using
+  # Cloudflare. See docs/self-hosting.md for turnserver.conf and TLS_CERT_DIR setup.
+  # ----------------------------------------------------------------------------
+  # coturn:
+  #   container_name: proxchat-coturn
+  #   image: coturn/coturn:latest
+  #   # Run as root so the container can read the wildcard cert files mounted
+  #   # below — Caddy/Let's Encrypt cert dirs are typically 0600 root:root.
+  #   # Safe under network_mode: host (no additional privilege beyond host).
+  #   user: "0:0"
+  #   network_mode: host
+  #   volumes:
+  #     - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
+  #     # Mount a host-side directory containing the wildcard cert (.crt and .key)
+  #     # used for TURNS on port 5349. Path is per-host so it lives in a local
+  #     # .env file rather than being committed:
+  #     #   echo 'TLS_CERT_DIR=/path/to/your/wildcard-cert-dir' > .env
+  #     # If you don't want TURNS, comment this mount and drop the TLS lines
+  #     # from turnserver.conf.
+  #     - ${TLS_CERT_DIR:-/dev/null}:/certs:ro
+  #   restart: unless-stopped
