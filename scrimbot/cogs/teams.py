@@ -5,8 +5,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..app import ScrimBot
-from ..autocomplete import team_autocomplete
 from ..config import MOD_PERMS
+from ..helpers import resolve_team, team_autocomplete
 from ..state import TeamState
 
 
@@ -28,40 +28,38 @@ class TeamsCog(commands.Cog):
         session = self.bot.sessions.get(interaction.guild_id)
         key = name.strip().lower()
         if not key:
-            await interaction.response.send_message("Give the team a name.", ephemeral=True)
+            error = "Give the team a name."
         elif key in session.teams:
-            await interaction.response.send_message(f"Team `{key}` already exists.", ephemeral=True)
+            error = f"Team `{key}` already exists."
         elif session.team_for_channel(channel.id):
-            await interaction.response.send_message(
-                f"{channel.mention} already belongs to a team.", ephemeral=True
-            )
+            error = f"{channel.mention} already belongs to a team."
         else:
             session.teams[key] = TeamState(name=key, channel_id=channel.id)
             await interaction.response.send_message(f"Registered **{key}** -> {channel.mention}")
+            return
+        await interaction.response.send_message(error, ephemeral=True)
 
     @team.command(name="remove", description="Remove a team and unmute its members")
     @app_commands.autocomplete(name=team_autocomplete)
     async def remove(self, interaction: discord.Interaction, name: str) -> None:
-        session = self.bot.sessions.get(interaction.guild_id)
-        team = session.teams.pop(name.strip().lower(), None)
-        if team is None:
-            await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
+        if (team := await resolve_team(interaction, name)) is None:
             return
-        team.cancel_rotation()
+        del self.bot.sessions.get(interaction.guild_id).teams[team.name]
         team.open()
         await interaction.response.defer()
         await self.bot.muter.apply_team(interaction.guild, team)
         await interaction.followup.send(f"Removed **{team.name}**.")
 
-    @team.command(name="list", description="Show teams and their active rules")
+    @team.command(name="list", description="Show teams, active rules, and who can talk")
     async def list_(self, interaction: discord.Interaction) -> None:
-        session = self.bot.sessions.get(interaction.guild_id)
-        if not session.teams:
+        teams = self.bot.sessions.get(interaction.guild_id).teams.values()
+        if not teams:
             await interaction.response.send_message("No teams yet. Use `/team register`.", ephemeral=True)
             return
         lines = [
-            f"**{t.name}** -> <#{t.channel_id}> | rule: `{t.mode.value}`"
-            for t in session.teams.values()
+            f"**{t.name}** -> <#{t.channel_id}> | `{t.mode.value}` | speakers: "
+            + (", ".join(f"<@{i}>" for i in t.allowed) or "everyone")
+            for t in teams
         ]
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 

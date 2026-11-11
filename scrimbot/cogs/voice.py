@@ -20,11 +20,10 @@ class VoiceCog(commands.Cog):
     async def on_voice_state_update(
         self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
     ) -> None:
-        # Ignore mute/deafen changes (including our own edits) to avoid feedback loops.
+        # Only channel moves matter; ignoring mute/deafen changes avoids feedback loops.
         if member.bot or before.channel == after.channel or after.channel is None:
             return
-        session = self.bot.sessions.get(member.guild.id)
-        team = session.team_for_channel(after.channel.id)
+        team = self.bot.sessions.get(member.guild.id).team_for_channel(after.channel.id)
         if team is None:
             await self.bot.muter.release_member(member)  # left team channels: unmute if ours
         else:

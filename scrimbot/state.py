@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -26,9 +27,14 @@ class TeamState:
     def muting_active(self) -> bool:
         return self.mode is not RuleMode.OPEN
 
+    def set_rule(self, mode: RuleMode, allowed: Iterable[int] = ()) -> None:
+        """Switch rule. Always stops any running rotation first."""
+        self.cancel_rotation()
+        self.mode = mode
+        self.allowed = set(allowed)
+
     def open(self) -> None:
-        self.mode = RuleMode.OPEN
-        self.allowed = set()
+        self.set_rule(RuleMode.OPEN)
 
     def cancel_rotation(self) -> None:
         if self.rotation_task and not self.rotation_task.done():
@@ -39,6 +45,9 @@ class TeamState:
 @dataclass
 class GuildSession:
     teams: dict[str, TeamState] = field(default_factory=dict)
+
+    def find(self, name: str) -> TeamState | None:
+        return self.teams.get(name.strip().lower())
 
     def team_for_channel(self, channel_id: int) -> TeamState | None:
         return next((t for t in self.teams.values() if t.channel_id == channel_id), None)
@@ -52,3 +61,7 @@ class SessionStore:
 
     def get(self, guild_id: int) -> GuildSession:
         return self._guilds.setdefault(guild_id, GuildSession())
+
+    def all_teams(self) -> Iterator[TeamState]:
+        for session in self._guilds.values():
+            yield from session.teams.values()

@@ -1,11 +1,6 @@
 *.env
 .venv/
+venv/
 __pycache__/
 *.pyc
-.env.example
-.env
-champ_audio/*
 announcements/*
-*.wav
-*.ogg
-*.log

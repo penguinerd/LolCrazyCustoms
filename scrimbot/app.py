@@ -8,7 +8,7 @@ from discord.ext import commands
 
 from . import cogs
 from .config import Settings
-from .services.mute import MuteManager
+from .mute import MuteManager
 from .state import SessionStore
 
 log = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ class ScrimBot(commands.Bot):
         self.muter = MuteManager()
 
     async def setup_hook(self) -> None:
-        # Auto-load every module in bot/cogs/ that defines setup().
+        # Auto-load every module in scrimbot/cogs/ that defines setup().
         for mod in pkgutil.iter_modules(cogs.__path__):
             await self.load_extension(f"{cogs.__name__}.{mod.name}")
             log.info("Loaded cog %s", mod.name)
